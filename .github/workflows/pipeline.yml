@@ -1,0 +1,135 @@
+name: CI-CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy application?"
+        required: true
+        default: "false"
+      env:
+        description: "Environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.env }}
+      DOCKER_TAG: ${{ github.run_number }}
+      DOCKER_IMAGE: aika-ai-${{ github.ref_name }}
+      REGISTRY: docker.artifactory.angodigitaltech.com:30000/artifactory/docker-images
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Gradle
+        run: ./gradlew clean build -x test
+
+      - name: Run Tests
+        run: ./gradlew test
+
+      - name: Build Docker Image
+        run: |
+          docker build -t $REGISTRY/$DOCKER_IMAGE:$DOCKER_TAG .
+
+      - name: Security Scan (Trivy)
+        run: |
+          sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.50.0_Linux-64bit.deb
+          trivy image $REGISTRY/$DOCKER_IMAGE:$DOCKER_TAG || true
+
+      - name: Login to Artifactory
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login $REGISTRY -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Push Docker Image
+        run: |
+          docker push $REGISTRY/$DOCKER_IMAGE:$DOCKER_TAG
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    if: ${{ github.event.inputs.deploy == 'true' }}
+
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.env }}
+      NAMESPACE: ${{ github.event.inputs.env }}
+      DOCKER_TAG: ${{ github.run_number }}
+      DOCKER_IMAGE: aika-ai-${{ github.ref_name }}
+      REGISTRY: docker.artifactory.angodigitaltech.com:30000/artifactory/docker-images
+      RELEASE_NAME: ango-ai-backend
+      CHART_NAME: ango-ai-backend-chart
+      HELM_REPO: http://artifactory.angodigitaltech.com/repository/helm-charts/
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Setup kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+      - name: Add Helm Repo
+        run: |
+          helm repo add backend $HELM_REPO \
+          --username "${{ secrets.ART_USER }}" \
+          --password "${{ secrets.ART_PASS }}"
+          helm repo update
+
+      - name: Deploy using Helm
+        run: |
+          helm upgrade --install $RELEASE_NAME backend/$CHART_NAME \
+          --namespace $NAMESPACE \
+          --create-namespace \
+          --set image.repository=$REGISTRY/$DOCKER_IMAGE \
+          --set image.tag=$DOCKER_TAG \
+          --wait --atomic
+
+  approve-prod:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.env == 'prod' }}
+
+    environment:
+      name: production
+
+    steps:
+      - name: Approval Gate
+        run: echo "Waiting for manual approval..."
+
+  rollback:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: failure() && github.event.inputs.env == 'prod'
+
+    steps:
+      - name: Setup kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+
+      - name: Rollback Helm
+        run: |
+          helm rollback ango-ai-backend 1 -n ${{ github.event.inputs.env }}
